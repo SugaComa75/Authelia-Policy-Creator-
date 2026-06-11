@@ -8,6 +8,7 @@ The goal is to give self-hosters a small folder they can drop onto any PHP-enabl
 
 - Single-page form.
 - Set `default_policy` (`deny`, `bypass`, `one_factor`, `two_factor`).
+- Paste existing `access_control` YAML and merge new rules into the correct order.
 - Add multiple access-control rules:
   - `domain`
   - `policy`
@@ -17,7 +18,7 @@ The goal is to give self-hosters a small folder they can drop onto any PHP-enabl
 - Friendly resource/path input:
   - `cloud` becomes `^/cloud([/?].*)?$`
   - `/admin` becomes `^/admin([/?].*)?$`
-  - `/cloud/docs` becomes `^/cloud/docs([/?].*)?$`
+  - `/cloud/admin.php` becomes `^/cloud/admin.php([/?].*)?$`
   - `regex:^/custom.*$` keeps the raw regex
   - `^/raw.*$` keeps the raw regex
 - Automatically sorts rules into a safer Authelia order.
@@ -32,10 +33,11 @@ The goal is to give self-hosters a small folder they can drop onto any PHP-enabl
 1. Place `index.php` and `style.css` in a folder on any PHP-enabled web server.
 2. Open `index.php` in your browser.
 3. Set the default policy.
-4. Add one or more rules.
-5. Click **Generate YAML**.
-6. Use **Copy YAML** to copy the output.
-7. Paste the YAML into your Authelia configuration under `access_control`.
+4. Optional: paste your current `access_control` YAML into the Existing YAML box.
+5. Add one or more new rules.
+6. Click **Generate YAML**.
+7. Use **Copy YAML** to copy the output.
+8. Replace your old `access_control` block with the generated merged output.
 
 ## Important: Rule Order Matters
 
@@ -56,6 +58,8 @@ Input rules:
 
 ```text
 tech.example.com / cloud / one_factor / group Family
+tech.example.com / cloud/admin.php / deny / group Family
+tech.example.com / cloud/admin.php / one_factor / group Admin
 tech.example.com / bypass
 kitchen.example.com / one_factor / group Family
 *.example.com / bypass
@@ -68,6 +72,20 @@ access_control:
   default_policy: deny
 
   rules:
+    - domain: "tech.example.com"
+      resources:
+        - "^/cloud/admin.php([/?].*)?$"
+      policy: deny
+      subject:
+        - "group:Family"
+
+    - domain: "tech.example.com"
+      resources:
+        - "^/cloud/admin.php([/?].*)?$"
+      policy: one_factor
+      subject:
+        - "group:Admin"
+
     - domain: "tech.example.com"
       resources:
         - "^/cloud([/?].*)?$"
@@ -103,7 +121,7 @@ Examples:
 ```text
 cloud
 /admin
-/cloud/docs
+/cloud/admin.php
 ```
 
 Output:
@@ -112,7 +130,7 @@ Output:
 resources:
   - "^/cloud([/?].*)?$"
   - "^/admin([/?].*)?$"
-  - "^/cloud/docs([/?].*)?$"
+  - "^/cloud/admin.php([/?].*)?$"
 ```
 
 For advanced users, raw regex is still supported:
@@ -155,13 +173,47 @@ subject:
   - "user:rik"
   - "user:alice"
 ```
+
 You can enter users with or without `user:`. The builder will normalise them.
+
+## Warning
+
+This tool generates YAML but does not validate your final Authelia configuration.
+
+Always test your configuration and verify access policies after applying changes to Authelia.
+
+
+## Deny Before Allow
+
+Authelia uses the first matching rule. If two rules match the same domain and resource, place `deny` before `one_factor` or `two_factor`.
+
+Example:
+
+```yaml
+- domain: "tech.example.com"
+  resources:
+    - "^/cloud/admin.php([/?].*)?$"
+  policy: deny
+  subject:
+    - "group:Family"
+
+- domain: "tech.example.com"
+  resources:
+    - "^/cloud/admin.php([/?].*)?$"
+  policy: one_factor
+  subject:
+    - "group:Admin"
+```
+
+This prevents a broader allow rule from granting access before the deny rule is checked.
+
 
 ## Nginx Proxy Manager .
 
 I use the following settings in the advance tab to make authelia work with NPM (only put in the hosts you want to protect.)
 
-```php
+
+```yaml
 auth_request /api/verify;
 auth_request_set $redirection_url $upstream_http_location;
 error_page 401 =302 $redirection_url;
@@ -191,9 +243,3 @@ location /api/verify {
 }
 ```
 
-
-## Warning
-
-This tool generates YAML but does not validate your final Authelia configuration.
-
-Always test your configuration and verify access policies after applying changes to Authelia.
