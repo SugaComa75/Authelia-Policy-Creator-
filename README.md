@@ -156,7 +156,7 @@ subject:
   - "user:alice"
 ```
 
-##Nginx Proxy Manager .
+## Nginx Proxy Manager .
 
 I use the following settings in the advance tab to make authelia work with NPM (only put in the hosts you want to protect.)
 
