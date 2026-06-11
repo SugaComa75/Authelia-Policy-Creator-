@@ -160,7 +160,7 @@ subject:
 
 I use the following settings in the advance tab to make authelia work with NPM (only put in the hosts you want to protect.)
 
-```text
+```php
 auth_request /api/verify;
 auth_request_set $redirection_url $upstream_http_location;
 error_page 401 =302 $redirection_url;
