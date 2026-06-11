@@ -213,7 +213,7 @@ This prevents a broader allow rule from granting access before the deny rule is 
 I use the following settings in the advance tab to make authelia work with NPM (only put in the hosts you want to protect.)
 
 
-```yaml
+```php
 auth_request /api/verify;
 auth_request_set $redirection_url $upstream_http_location;
 error_page 401 =302 $redirection_url;
