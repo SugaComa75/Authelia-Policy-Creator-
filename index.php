@@ -7,12 +7,30 @@ $allowed_policies = ['deny', 'bypass', 'one_factor', 'two_factor'];
 
 // Helper: escape double quotes for YAML safety.
 function escape_quotes($str) {
-    return str_replace('"', '\"', trim($str));
+    return str_replace('"', '\\"', trim($str));
 }
 
-// Helper: escape a path segment for safe regex output.
-function regex_escape_path($path) {
-    return preg_quote($path, '/');
+// Helper: clean a friendly path for Authelia resource output.
+//
+// Important: Authelia resource examples generally use paths like /cloud/admin.php,
+// not PHP preg_quote output like \/cloud\/admin\.php. For friendly path mode
+// we therefore keep normal URL path characters as typed and only strip characters
+// that are unsafe in a simple path. Advanced users can still use regex: to supply
+// exact custom regex.
+function clean_friendly_path($path) {
+    $path = trim($path);
+
+    // Remove anchors accidentally pasted into friendly mode.
+    $path = preg_replace('/^\^+/', '', $path);
+    $path = preg_replace('/\$+$/', '', $path);
+
+    // Keep common URL path characters. Remove quotes and whitespace.
+    $path = preg_replace('/["\'`\s]/', '', $path);
+
+    // Collapse repeated slashes.
+    $path = preg_replace('#/+#', '/', $path);
+
+    return trim($path, '/');
 }
 
 // Helper: turn a friendly keyword/path into an Authelia resource regex.
@@ -55,12 +73,11 @@ function normalise_resource_rule($raw) {
         return '^/([/?].*)?$';
     }
 
-    $segments = array_filter(explode('/', $value), function ($segment) {
-        return trim($segment) !== '';
-    });
+    $safe_path = clean_friendly_path($value);
 
-    $safe_segments = array_map('regex_escape_path', $segments);
-    $safe_path = implode('\/', $safe_segments);
+    if ($safe_path === '') {
+        return '^/([/?].*)?$';
+    }
 
     return '^/' . $safe_path . '([/?].*)?$';
 }
@@ -130,7 +147,7 @@ function build_resources_block($resources_raw) {
 function rule_priority($rule) {
     $domain = $rule['domain'] ?? '';
     $policy = $rule['policy'] ?? 'deny';
-    $has_resources = trim($rule['resources'] ?? '') !== '';
+    $has_resources = !empty($rule['has_resources']) || trim($rule['resources'] ?? '') !== '';
     $is_wildcard = strpos($domain, '*') !== false;
 
     if ($has_resources) {
@@ -148,15 +165,230 @@ function rule_priority($rule) {
     return 20; // Exact protected/deny rules.
 }
 
+// Helper: sort policies where equally-specific rules may overlap.
+// Deny must come before allow rules for the same resource, otherwise Authelia stops at the allow rule.
+function policy_priority($rule) {
+    $policy = $rule['policy'] ?? 'deny';
+
+    if ($policy === 'deny') {
+        return 0;
+    }
+
+    if ($policy === 'two_factor') {
+        return 1;
+    }
+
+    if ($policy === 'one_factor') {
+        return 2;
+    }
+
+    if ($policy === 'bypass') {
+        return 3;
+    }
+
+    return 4;
+}
+
+// Helper: put longer resource regexes first when rules share the same domain.
+// Example: /cloud/admin.php must be checked before /cloud.
+function resource_specificity($rule) {
+    $resources = trim($rule['resources'] ?? '');
+    return strlen($resources);
+}
+
+// Extract a scalar YAML value from a line such as domain: "example.com".
+function extract_yaml_scalar($line, $key) {
+    if (!preg_match('/^\s*' . preg_quote($key, '/') . '\s*:\s*(.*?)\s*$/', $line, $m)) {
+        return '';
+    }
+
+    $value = trim($m[1]);
+    $value = trim($value, "'\"");
+    return $value;
+}
+
+// Extract an existing access_control section from pasted YAML and return raw rule blocks.
+// This is intentionally lightweight and dependency-free. It preserves each existing rule block as text.
+function parse_existing_access_control($yaml_text) {
+    $result = [
+        'default_policy' => '',
+        'rules' => [],
+    ];
+
+    $yaml_text = trim((string)$yaml_text);
+    if ($yaml_text === '') {
+        return $result;
+    }
+
+    $lines = preg_split('/\r\n|\r|\n/', $yaml_text);
+    $in_access = false;
+    $in_rules = false;
+    $current = [];
+    $order = 0;
+
+    foreach ($lines as $line) {
+        if (preg_match('/^access_control:\s*$/', $line)) {
+            $in_access = true;
+            $in_rules = false;
+            continue;
+        }
+
+        // If the user pasted only the contents below access_control, still accept it.
+        if (!$in_access && preg_match('/^\s*(default_policy|rules):/', $line)) {
+            $in_access = true;
+        }
+
+        if (!$in_access) {
+            continue;
+        }
+
+        if (preg_match('/^\S[^:]*:\s*$/', $line) && !preg_match('/^access_control:\s*$/', $line)) {
+            // A new top-level YAML section means access_control has ended.
+            if (!empty($current)) {
+                $result['rules'][] = build_existing_rule_from_lines($current, $order++);
+                $current = [];
+            }
+            break;
+        }
+
+        if (preg_match('/^\s*default_policy\s*:\s*(.*?)\s*$/', $line, $m)) {
+            $result['default_policy'] = trim(trim($m[1]), "'\"");
+            continue;
+        }
+
+        if (preg_match('/^\s*rules\s*:\s*$/', $line)) {
+            $in_rules = true;
+            continue;
+        }
+
+        if ($in_rules) {
+            if (preg_match('/^\s*-\s+domain\s*:/', $line)) {
+                if (!empty($current)) {
+                    $result['rules'][] = build_existing_rule_from_lines($current, $order++);
+                    $current = [];
+                }
+                $current[] = $line;
+            } elseif (!empty($current)) {
+                $current[] = $line;
+            }
+        }
+    }
+
+    if (!empty($current)) {
+        $result['rules'][] = build_existing_rule_from_lines($current, $order++);
+    }
+
+    return $result;
+}
+
+// Convert a raw existing YAML rule block into sortable metadata while keeping the original YAML text.
+function build_existing_rule_from_lines($lines, $order) {
+    $domain = '';
+    $policy = '';
+    $has_resources = false;
+
+    foreach ($lines as $line) {
+        if (preg_match('/^\s*-\s+domain\s*:\s*(.*?)\s*$/', $line, $m)) {
+            $domain = trim(trim($m[1]), "'\"");
+        }
+        if (preg_match('/^\s*policy\s*:\s*(.*?)\s*$/', $line, $m)) {
+            $policy = trim(trim($m[1]), "'\"");
+        }
+        if (preg_match('/^\s*resources\s*:\s*$/', $line)) {
+            $has_resources = true;
+        }
+    }
+
+    return [
+        'type' => 'existing',
+        'domain' => $domain,
+        'policy' => $policy ?: 'deny',
+        'has_resources' => $has_resources,
+        'raw' => normalise_existing_rule_indent($lines),
+        'original' => $order,
+    ];
+}
+
+// Normalise existing rule indentation to fit under access_control -> rules.
+function normalise_existing_rule_indent($lines) {
+    $trimmed = [];
+    foreach ($lines as $line) {
+        $trimmed[] = rtrim($line);
+    }
+
+    // Find indentation of first "- domain" line and shift it to 4 spaces.
+    $first_indent = 0;
+    foreach ($trimmed as $line) {
+        if (preg_match('/^(\s*)-\s+domain\s*:/', $line, $m)) {
+            $first_indent = strlen($m[1]);
+            break;
+        }
+    }
+
+    $out = [];
+    foreach ($trimmed as $line) {
+        if ($line === '') {
+            continue;
+        }
+        $remove = min($first_indent, strspn($line, ' '));
+        $out[] = '    ' . substr($line, $remove);
+    }
+
+    return implode("\n", $out) . "\n";
+}
+
+// Build a new rule into a raw YAML block and sortable metadata.
+function build_new_rule($rule) {
+    $raw = '    - domain: "' . escape_quotes($rule['domain']) . '"' . "\n";
+
+    $resources_block = build_resources_block($rule['resources']);
+    if ($resources_block !== '') {
+        $raw .= $resources_block;
+    }
+
+    $raw .= "      policy: " . $rule['policy'] . "\n";
+
+    $subject_block = build_subject_block($rule['users'], $rule['groups']);
+    if ($subject_block !== '') {
+        $raw .= $subject_block;
+    }
+
+    return [
+        'type' => 'new',
+        'domain' => $rule['domain'],
+        'policy' => $rule['policy'],
+        'resources' => $rule['resources'],
+        'has_resources' => trim($rule['resources']) !== '',
+        'raw' => $raw,
+        'original' => $rule['original'],
+    ];
+}
+
 // Generate YAML if form submitted.
 $yaml_output = '';
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+$merge_notice = '';
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    $existing_yaml = $_POST['existing_yaml'] ?? '';
+    $existing = parse_existing_access_control($existing_yaml);
+
     $default_policy = isset($_POST['default_policy']) ? trim($_POST['default_policy']) : 'deny';
     if (!in_array($default_policy, $allowed_policies, true)) {
         $default_policy = 'deny';
     }
 
+    // If the user pasted an existing config and did not change the default selector, honour the pasted value.
+    if (!empty($existing['default_policy']) && (empty($_POST['default_policy_changed']) || $_POST['default_policy_changed'] !== '1')) {
+        if (in_array($existing['default_policy'], $allowed_policies, true)) {
+            $default_policy = $existing['default_policy'];
+        }
+    }
+
     $rules = [];
+
+    foreach ($existing['rules'] as $existing_rule) {
+        $existing_rule['original'] = 100000 + ($existing_rule['original'] ?? 0);
+        $rules[] = $existing_rule;
+    }
 
     if (isset($_POST['domain']) && is_array($_POST['domain'])) {
         $domains       = $_POST['domain'];
@@ -177,14 +409,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $policy = 'deny';
             }
 
-            $rules[] = [
+            $rules[] = build_new_rule([
                 'domain'    => $domain,
                 'policy'    => $policy,
                 'users'     => $users_arr[$i] ?? '',
                 'groups'    => $groups_arr[$i] ?? '',
                 'resources' => $resources_arr[$i] ?? '',
-                'original'   => $i,
-            ];
+                'original'  => $i,
+            ]);
         }
     }
 
@@ -194,7 +426,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             return $priority;
         }
 
-        // Keep original order inside each priority group.
+        $domainCompare = strcmp($a['domain'] ?? '', $b['domain'] ?? '');
+        if ($domainCompare !== 0) {
+            return $domainCompare;
+        }
+
+        $aHasResources = !empty($a['has_resources']) || trim($a['resources'] ?? '') !== '';
+        $bHasResources = !empty($b['has_resources']) || trim($b['resources'] ?? '') !== '';
+
+        if ($aHasResources && $bHasResources) {
+            // More specific/longer resource rules before broader ones.
+            $specificity = resource_specificity($b) <=> resource_specificity($a);
+            if ($specificity !== 0) {
+                return $specificity;
+            }
+
+            $resourceCompare = strcmp($a['resources'] ?? '', $b['resources'] ?? '');
+            if ($resourceCompare !== 0) {
+                return $resourceCompare;
+            }
+        }
+
+        $policyCompare = policy_priority($a) <=> policy_priority($b);
+        if ($policyCompare !== 0) {
+            return $policyCompare;
+        }
+
+        // Keep original order only after safety sorting has been applied.
         return ($a['original'] ?? 0) <=> ($b['original'] ?? 0);
     });
 
@@ -203,24 +461,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $yaml .= "  rules:\n";
 
     foreach ($rules as $rule) {
-        $yaml .= '    - domain: "' . escape_quotes($rule['domain']) . '"' . "\n";
-
-        $resources_block = build_resources_block($rule['resources']);
-        if ($resources_block !== '') {
-            $yaml .= $resources_block;
-        }
-
-        $yaml .= "      policy: " . $rule['policy'] . "\n";
-
-        $subject_block = build_subject_block($rule['users'], $rule['groups']);
-        if ($subject_block !== '') {
-            $yaml .= $subject_block;
-        }
-
-        $yaml .= "\n";
+        $yaml .= rtrim($rule['raw']) . "\n\n";
     }
 
     $yaml_output = trim($yaml) . "\n";
+
+    if (trim($existing_yaml) !== '') {
+        $merge_notice = 'Existing YAML was included and the combined rules were sorted into the recommended order.';
+    }
 }
 
 // Helper for repopulating form values.
@@ -257,16 +505,38 @@ function selected_policy($current, $value) {
             <form method="post" id="policyForm">
                 <div class="form-row">
                     <label for="default_policy">Default policy:</label>
-                    <select name="default_policy" id="default_policy">
+                    <select name="default_policy" id="default_policy" onchange="markDefaultPolicyChanged()">
                         <?php $current_default = $_POST['default_policy'] ?? 'deny'; ?>
                         <option value="deny" <?php echo selected_policy($current_default, 'deny'); ?>>deny</option>
                         <option value="bypass" <?php echo selected_policy($current_default, 'bypass'); ?>>bypass</option>
                         <option value="one_factor" <?php echo selected_policy($current_default, 'one_factor'); ?>>one_factor</option>
                         <option value="two_factor" <?php echo selected_policy($current_default, 'two_factor'); ?>>two_factor</option>
                     </select>
+                    <input type="hidden" name="default_policy_changed" id="default_policy_changed" value="<?php echo htmlspecialchars($_POST['default_policy_changed'] ?? '0', ENT_QUOTES); ?>">
                 </div>
 
-                <h2>Access-Control Rules</h2>
+                <h2>Existing YAML Optional</h2>
+                <p class="hint">
+                    Paste your current <code>access_control</code> YAML here to merge it with new rules. Existing rules are preserved, then the combined output is sorted safely.
+                </p>
+                <div class="form-row">
+                    <label for="existing_yaml">Current access_control YAML:</label>
+                    <textarea name="existing_yaml" id="existing_yaml" rows="10" placeholder="access_control:
+  default_policy: deny
+
+  rules:
+    - domain: &quot;tech.example.com&quot;
+      policy: bypass"><?php echo htmlspecialchars($_POST['existing_yaml'] ?? '', ENT_QUOTES); ?></textarea>
+                    <small class="field-help">
+                        You can paste the full <code>access_control:</code> block, or just the <code>default_policy</code> and <code>rules</code> content. The tool does a simple merge and does not fully validate YAML.
+                    </small>
+                </div>
+
+                <?php if ($merge_notice !== ''): ?>
+                    <p class="success"><?php echo htmlspecialchars($merge_notice, ENT_QUOTES); ?></p>
+                <?php endif; ?>
+
+                <h2>New Rules to Add</h2>
                 <p class="hint">
                     Add rules from most specific to most general. The generator will also sort them safely:
                     resource/path rules first, exact protected domains next, public bypass rules after that, and wildcard rules last.
@@ -282,7 +552,7 @@ function selected_policy($current, $value) {
 
                 <div id="rulesContainer">
                     <?php
-                    $rule_count = ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['domain']) && is_array($_POST['domain']))
+                    $rule_count = (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST' && isset($_POST['domain']) && is_array($_POST['domain']))
                         ? count($_POST['domain'])
                         : 1;
 
@@ -344,7 +614,7 @@ function selected_policy($current, $value) {
         <section class="card">
             <h2>Generated YAML</h2>
             <p class="hint">
-                Copy this into your Authelia configuration under the <code>access_control</code> section.
+                Copy this into your Authelia configuration. If you pasted existing YAML, this output is the merged replacement <code>access_control</code> block.
             </p>
             <textarea id="yamlOutput" rows="18" readonly><?php echo htmlspecialchars($yaml_output, ENT_QUOTES); ?></textarea>
             <div class="actions">
@@ -360,6 +630,7 @@ function selected_policy($current, $value) {
                 <li><strong>one_factor</strong> – requires login.</li>
                 <li><strong>two_factor</strong> – requires login plus 2FA.</li>
                 <li><strong>resources</strong> – regex path matches. Friendly inputs such as <code>cloud</code> are converted automatically.</li>
+                <li><strong>existing YAML</strong> – paste your current rules to merge new rules into the right order.</li>
             </ul>
 
             <h3>Rule order</h3>
@@ -377,10 +648,10 @@ function selected_policy($current, $value) {
 
             <h3>Resource keyword examples</h3>
 <pre>
-cloud        becomes "^/cloud([/?].*)?$"
-/admin       becomes "^/admin([/?].*)?$"
-/cloud/docs  becomes "^/cloud/docs([/?].*)?$"
-regex:^/x.*$ keeps "^/x.*$"
+cloud            becomes "^/cloud([/?].*)?$"
+/admin           becomes "^/admin([/?].*)?$"
+/cloud/admin.php becomes "^/cloud/admin.php([/?].*)?$"
+regex:^/x.*$     keeps "^/x.*$"
 ^/raw.*$     keeps "^/raw.*$"
 </pre>
 
@@ -449,6 +720,13 @@ function createRuleCard() {
     return container;
 }
 
+function markDefaultPolicyChanged() {
+    const flag = document.getElementById('default_policy_changed');
+    if (flag) {
+        flag.value = '1';
+    }
+}
+
 function addRule() {
     const rulesContainer = document.getElementById('rulesContainer');
     rulesContainer.appendChild(createRuleCard());
@@ -495,6 +773,16 @@ function clearForm() {
     const rulesContainer = document.getElementById('rulesContainer');
     rulesContainer.innerHTML = '';
     rulesContainer.appendChild(createRuleCard());
+
+    const existingYaml = document.getElementById('existing_yaml');
+    if (existingYaml) {
+        existingYaml.value = '';
+    }
+
+    const policyChanged = document.getElementById('default_policy_changed');
+    if (policyChanged) {
+        policyChanged.value = '0';
+    }
 
     document.getElementById('yamlOutput').value = '';
 }
