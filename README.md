@@ -155,6 +155,7 @@ subject:
   - "user:rik"
   - "user:alice"
 ```
+You can enter users with or without `user:`. The builder will normalise them.
 
 ## Nginx Proxy Manager .
 
@@ -190,7 +191,6 @@ location /api/verify {
 }
 ```
 
-You can enter users with or without `user:`. The builder will normalise them.
 
 ## Warning
 
