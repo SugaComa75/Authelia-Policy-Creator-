@@ -518,14 +518,17 @@ function selected_policy($current, $value) {
         <p>A simple local PHP tool to generate <code>access_control</code> YAML rules for Authelia.</p>
         <p class="warning">
             ⚠️ This tool does <strong>not</strong> validate your Authelia configuration.
-            Always test the generated YAML with Authelia before using it in production.
+            Always test the generated YAML with Authelia before using it in production. <a class="quick-link" href="#help-guide">
+							<strong>Guide </strong>
+							<span>our help Section.</span>
+						</a>
         </p>
     </header>
 
     <main>
         <section class="card">
             <h2>Default Policy</h2>
-            <form method="post" id="policyForm">
+            <form method="post" action="#rule-view" id="policyForm">
                 <div class="form-row">
                     <label for="default_policy">Default policy:</label>
                     <select name="default_policy" id="default_policy" onchange="markDefaultPolicyChanged()">
@@ -634,7 +637,7 @@ function selected_policy($current, $value) {
             </form>
         </section>
 
-        <section class="card">
+        <section class="card" id="rule-view">
             <h2>Generated YAML</h2>
             <p class="hint">
                 Copy this into your Authelia configuration. If you pasted existing YAML, this output is the merged replacement <code>access_control</code> block.
@@ -645,7 +648,7 @@ function selected_policy($current, $value) {
             </div>
         </section>
 
-        <section class="card">
+        <section class="card" id="help-guide">
             <h2>Help</h2>
             <ul class="help-list">
                 <li><strong>bypass</strong> – no login required.</li>
