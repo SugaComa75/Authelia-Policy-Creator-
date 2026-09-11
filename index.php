@@ -286,8 +286,30 @@ function build_existing_rule_from_lines($lines, $order) {
     $domain = '';
     $policy = '';
     $has_resources = false;
+    $resources = [];
+    $in_resources = false;
 
     foreach ($lines as $line) {
+        if (preg_match('/^\s*resources\s*:\s*(.*?)\s*$/', $line, $m)) {
+            $has_resources = true;
+            $in_resources = true;
+            $inline_resource = trim(trim($m[1]), "'\"");
+            if ($inline_resource !== '') {
+                $resources[] = $inline_resource;
+            }
+            continue;
+        }
+
+        // Preserve list-valued resource regexes so specificity sorting works
+        // for rules pasted from an existing Authelia configuration.
+        if ($in_resources) {
+            if (preg_match('/^\s*-\s+(.*?)\s*$/', $line, $m)) {
+                $resources[] = trim(trim($m[1]), "'\"");
+                continue;
+            }
+            $in_resources = false;
+        }
+
         if (preg_match('/^\s*-\s+domain\s*:\s*(.*?)\s*$/', $line, $m)) {
             $domain = trim(trim($m[1]), "'\"");
         }
@@ -303,6 +325,7 @@ function build_existing_rule_from_lines($lines, $order) {
         'type' => 'existing',
         'domain' => $domain,
         'policy' => $policy ?: 'deny',
+        'resources' => implode("\n", $resources),
         'has_resources' => $has_resources,
         'raw' => normalise_existing_rule_indent($lines),
         'original' => $order,
